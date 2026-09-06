@@ -46,6 +46,8 @@
 
 ## Comprehensive-mode ownership
 
+- Every task-bound Oracle lock has a same-task last-resort quarantine path after ordinary recovery and evidence settlement are exhausted. It requires explicit user authority, the exact state hash, and stopped run-owned processes; preserves the provider outcome as `unknown`; archives the unchanged run with append-only intent/completion receipts; and releases the active local lock. It never authorizes a replacement prompt. A separate exact-completion-hash authorization must explicitly acknowledge possible duplicate execution before fresh work. Foreign tasks cannot quarantine or authorize another task's run.
+
 - Oracle ownership is task scoped, not project scoped. Two different Codex
   tasks may run concurrently against the same exact project root; each owns its
   own task ID, run, mission hash, slug/conversation, browser profile, dynamic

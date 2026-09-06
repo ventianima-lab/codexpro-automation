@@ -52,6 +52,7 @@ FAST_TARGETS = [
     "tests/test_chatgpt_oracle_run.py::test_recovery_captures_output_and_updates_state",
     "tests/test_chatgpt_oracle_run.py::test_unresolved_exact_session_blocks_different_parent_submission",
     "tests/test_chatgpt_oracle_run.py::test_recovery_never_downgrades_durable_complete",
+    "tests/test_chatgpt_oracle_run.py::test_unknown_run_quarantine_releases_lock_but_requires_separate_retry_authority",
     "tests/test_chatgpt_oracle_diagnose.py",
     "tests/test_chatgpt_oracle_incident.py",
     "tests/test_chatgpt_oracle_compat.py",

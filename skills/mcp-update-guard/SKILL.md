@@ -133,6 +133,42 @@ instead of the layer that failed.
 - Treat `safe_for_fresh_run: false` as binding. Do not resubmit, stop, or close
   another session's work while repairing code.
 
+## Unknown-run quarantine escape hatch
+
+Every task-bound Oracle lock has a last-resort administrative terminalization
+path. Use it only after ordinary exact recovery and evidence-based settlement
+cannot finish, the user explicitly authorizes the exact run, and every recorded
+run-owned process is stopped. It preserves the provider outcome as `unknown`;
+it does not reinterpret the run as submitted, unsubmitted, successful, or
+failed.
+
+Preview and then repeat without `--dry-run`:
+
+```text
+python <installed-or-source>/bin/chatgpt_oracle_run.py quarantine-unknown-run --run-dir <exact-active-run-dir> --expected-state-sha256 <sha256> --confirmation user-authorized-unknown-run-quarantine --reason "<exact user authority and incident>" --dry-run
+```
+
+The command is same-task only. It writes an append-only intent, atomically
+moves the unchanged run under `quarantined-runs/<source-thread-id>/`, verifies
+the archived tree, and writes a completion receipt under
+`quarantine-lock-receipts/<source-thread-id>/`. Repeating the command resumes a
+crash before or after the move. Never delete or edit the original state, adopt
+a foreign task, or use quarantine while an exact run-owned process is live.
+
+Quarantine releases the active local lock but deliberately installs a retry
+barrier. A new prompt remains blocked until the same owning task receives a
+second explicit user decision acknowledging that the provider outcome is still
+unknown. Preview and then apply:
+
+```text
+python <installed-or-source>/bin/chatgpt_oracle_run.py authorize-retry-after-quarantine --completion-receipt <exact-completion-json> --expected-completion-sha256 <sha256> --confirmation user-authorized-retry-after-unknown-quarantine --reason "<explicit duplicate-risk decision>" --dry-run
+```
+
+This two-step contract guarantees that a local lock can be terminalized without
+silently converting network uncertainty into a duplicate submission. A foreign
+task still routes to the exact owner; legacy-unbound retirement remains a
+separate bounded maintenance procedure.
+
 ## Safety boundaries
 
 - Do not delete or recreate credential-bearing state during a normal update.

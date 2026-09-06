@@ -58,6 +58,13 @@ Use this routing in the Codex global `AGENTS.md` after installing the package.
   submission. Foreign or legacy-unbound runs are never inferred from the
   newest project run and cannot be recovered, harvested, followed up, stopped,
   or canceled by the current task.
+- An owned unresolved run that cannot finish through ordinary recovery or
+  evidence settlement has a two-step administrative escape hatch. The owning
+  task may quarantine the exact stopped run while preserving its provider
+  outcome as unknown and its bytes in an append-only-receipted archive. This
+  releases the active lock but blocks every fresh prompt until a separate,
+  hash-bound user authorization acknowledges possible duplicate execution.
+  Foreign tasks cannot quarantine or authorize another task's run.
 - Incident and completion reports preserve that same boundary. The machine
   packet records the evaluating task, exact owner task, run ID, slug, and one
   bounded operational instruction. A foreign task receives only a route back

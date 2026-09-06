@@ -92,6 +92,16 @@ A nonzero Oracle exit after launch, including a browser response timeout, is
 `attention_required` rather than proof that the web session failed. It retains
 same-task exact-run ownership and permits only exact-slug `live` or `harvest`
 recovery; it never authorizes a replacement submission.
+
+If exact recovery and all evidence-based settlements are exhausted, an
+explicitly authorized same-task operator may use `quarantine-unknown-run` as
+the final local lock escape hatch. The command requires the exact state hash
+and stopped run-owned processes, preserves the provider outcome as `unknown`,
+and archives the run with append-only intent/completion receipts. It releases
+the active lock but creates a retry barrier. Only the separate
+`authorize-retry-after-quarantine` command, with the exact completion hash and
+explicit acknowledgement of possible duplicate execution, permits another
+prompt. Foreign tasks cannot quarantine or authorize the run.
 `--browser-timeout` is a browser observation window, not proof that the web run
 ended. The default is aligned with the observed provider boundary. Separately,
 4,800 seconds is only a caution/status-audit threshold: the runner records the

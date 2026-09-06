@@ -511,6 +511,8 @@ RECOVERY_BINDING_UNAVAILABLE_MARKERS = (
     'No live ChatGPT tab matched session',
     'session metadata has no recoverable ChatGPT conversation URL',
 )
+UNKNOWN_RUN_QUARANTINE_CONFIRMATION = "user-authorized-unknown-run-quarantine"
+UNKNOWN_RUN_RETRY_CONFIRMATION = "user-authorized-retry-after-unknown-quarantine"
 
 
 def exact_session_state(path: Path) -> str | None:
@@ -757,6 +759,692 @@ def run_owned_process_is_alive(
         pid,
         process_probe=probe,
     )
+
+
+def _quarantine_paths(
+    run_root: Path,
+    *,
+    source_thread_id: str,
+    run_id: str,
+) -> dict[str, Path]:
+    ledger_root = run_root.expanduser().resolve()
+    if ledger_root.name != "runs":
+        raise OracleRunError(
+            "QUARANTINE_RUN_ROOT_INVALID",
+            "Oracle quarantine requires the canonical active runs directory",
+            {"run_root": str(ledger_root)},
+        )
+    if STATE.SOURCE_THREAD_ID_RE.fullmatch(source_thread_id) is None:
+        raise OracleRunError(
+            "QUARANTINE_SOURCE_THREAD_INVALID",
+            "Oracle quarantine requires one exact task owner",
+            {"source_thread_id": source_thread_id},
+        )
+    if STATE.RUN_ID_RE.fullmatch(run_id) is None:
+        raise OracleRunError(
+            "QUARANTINE_RUN_ID_INVALID",
+            "Oracle quarantine requires one safe exact run ID",
+            {"run_id": run_id},
+        )
+    receipt_base = ledger_root.parent / "quarantine-lock-receipts"
+    archive_base = ledger_root.parent / "quarantined-runs"
+    for base in (receipt_base, archive_base):
+        if base.is_symlink() or (base.exists() and not base.is_dir()):
+            raise OracleRunError(
+                "QUARANTINE_PATH_INVALID",
+                "Oracle quarantine base must be a real directory",
+                {"path": str(base)},
+            )
+    receipt_root = receipt_base / source_thread_id
+    archive_root = archive_base / source_thread_id
+    for root in (receipt_root, archive_root):
+        if root.is_symlink() or (root.exists() and not root.is_dir()):
+            raise OracleRunError(
+                "QUARANTINE_PATH_INVALID",
+                "Oracle quarantine task path must be a real directory",
+                {"path": str(root)},
+            )
+    return {
+        "receipt_root": receipt_root,
+        "archive_root": archive_root,
+        "archive": archive_root / run_id,
+        "intent": receipt_root / f"{run_id}.intent.json",
+        "completion": receipt_root / f"{run_id}.complete.json",
+        "authorization": receipt_root / f"{run_id}.retry-authorized.json",
+    }
+
+
+def _read_regular_json(path: Path) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise OracleRunError(
+            "QUARANTINE_RECEIPT_INVALID",
+            "Oracle quarantine receipts must be regular files",
+            {"path": str(path)},
+        )
+    try:
+        payload = json.loads(path.read_bytes().decode("utf-8", errors="strict"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise OracleRunError(
+            "QUARANTINE_RECEIPT_INVALID",
+            "Oracle quarantine receipt is not strict UTF-8 JSON",
+            {"path": str(path)},
+        ) from exc
+    if not isinstance(payload, dict):
+        raise OracleRunError(
+            "QUARANTINE_RECEIPT_INVALID",
+            "Oracle quarantine receipt must contain one object",
+            {"path": str(path)},
+        )
+    return payload
+
+
+def _snapshot_quarantine_tree(run_dir: Path) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    regular_file_count = 0
+    total_file_bytes = 0
+    for path in sorted(run_dir.rglob("*"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(run_dir).as_posix()
+        if path.is_symlink():
+            rows.append({"path": relative, "kind": "symlink", "target": os.readlink(path)})
+        elif path.is_file():
+            size_bytes = path.stat().st_size
+            regular_file_count += 1
+            total_file_bytes += size_bytes
+            rows.append({
+                "path": relative,
+                "kind": "file",
+                "size_bytes": size_bytes,
+                "sha256": STATE.sha256_file(path),
+            })
+        elif path.is_dir():
+            rows.append({"path": relative, "kind": "directory"})
+        else:
+            rows.append({"path": relative, "kind": "other", "mode": path.lstat().st_mode})
+    canonical = json.dumps(
+        rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "schema": "codex.chatgpt.oracle-quarantine-tree/v1",
+        "sha256": hashlib.sha256(canonical).hexdigest(),
+        "entry_count": len(rows),
+        "regular_file_count": regular_file_count,
+        "total_file_bytes": total_file_bytes,
+    }
+
+
+def _oracle_meta_quarantine_evidence(slug: str) -> dict[str, Any]:
+    session_root = Path(
+        os.environ.get("ORACLE_SESSION_ROOT") or (Path.home() / ".oracle" / "sessions")
+    ).expanduser().resolve()
+    meta_path = session_root / slug / "meta.json"
+    if not meta_path.exists() and not meta_path.is_symlink():
+        return {
+            "status": "absent",
+            "path": str(meta_path),
+            "sha256": None,
+            "process_ids": [],
+        }
+    meta, raw = _strict_json_regular_file(meta_path, label="quarantine_oracle_meta")
+    if str(meta.get("id") or "") != slug:
+        raise OracleRunError(
+            "QUARANTINE_ORACLE_META_INVALID",
+            "Oracle metadata does not match the exact run slug",
+            {"path": str(meta_path), "slug": slug},
+        )
+    browser = meta.get("browser") if isinstance(meta.get("browser"), dict) else {}
+    runtime = browser.get("runtime") if isinstance(browser.get("runtime"), dict) else {}
+    process_ids = sorted({
+        value
+        for value in (runtime.get("controllerPid"), runtime.get("chromePid"))
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+    })
+    return {
+        "status": str(meta.get("status") or "unknown"),
+        "completed_at": str(meta.get("completedAt") or "") or None,
+        "path": str(meta_path),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "process_ids": process_ids,
+    }
+
+
+def _validate_quarantine_completion(
+    completion_path: Path,
+    *,
+    run_root: Path,
+    project_root: Path,
+    source_thread_id: str,
+) -> dict[str, Any]:
+    payload = _read_regular_json(completion_path)
+    run_id = completion_path.name.removesuffix(".complete.json")
+    paths = _quarantine_paths(
+        run_root,
+        source_thread_id=source_thread_id,
+        run_id=run_id,
+    )
+    expected = {
+        "schema": "codex.chatgpt.oracle-unknown-run-quarantine/v1",
+        "status": "unknown-run-quarantined",
+        "target_source_thread_id": source_thread_id,
+        "project_root": str(project_root.expanduser().resolve()),
+        "run_id": run_id,
+        "archive_run_dir": str(paths["archive"]),
+        "completion_receipt": str(paths["completion"]),
+        "provider_outcome": "unknown",
+        "new_submission_authorized": False,
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        raise OracleRunError(
+            "QUARANTINE_COMPLETION_INVALID",
+            "Oracle quarantine completion receipt identity is inconsistent",
+            {"path": str(completion_path), "run_id": run_id},
+        )
+    intent_path = paths["intent"]
+    intent_sha256 = str(payload.get("intent_sha256") or "")
+    if (
+        str(payload.get("intent_receipt") or "") != str(intent_path)
+        or intent_path.is_symlink()
+        or not intent_path.is_file()
+        or not re.fullmatch(r"[a-f0-9]{64}", intent_sha256)
+        or STATE.sha256_file(intent_path) != intent_sha256
+    ):
+        raise OracleRunError(
+            "QUARANTINE_INTENT_INVALID",
+            "Oracle quarantine completion no longer matches its append-only intent",
+            {"path": str(intent_path), "run_id": run_id},
+        )
+    archive = paths["archive"]
+    state_path = archive / "state.json"
+    state_sha256 = str(payload.get("state_sha256") or "")
+    if (
+        not archive.is_dir()
+        or archive.is_symlink()
+        or state_path.is_symlink()
+        or not state_path.is_file()
+        or not re.fullmatch(r"[a-f0-9]{64}", state_sha256)
+        or STATE.sha256_file(state_path) != state_sha256
+    ):
+        raise OracleRunError(
+            "QUARANTINE_ARCHIVE_INVALID",
+            "Oracle quarantine archive no longer matches its completion receipt",
+            {"path": str(archive), "run_id": run_id},
+        )
+    archived_state = STATE.load_state(state_path)
+    oracle = archived_state.get("oracle") if isinstance(archived_state.get("oracle"), dict) else {}
+    mission = archived_state.get("mission") if isinstance(archived_state.get("mission"), dict) else {}
+    if (
+        str(archived_state.get("run_id") or "") != run_id
+        or str(archived_state.get("project_root") or "") != str(project_root.expanduser().resolve())
+        or STATE.source_thread_id_from_state(archived_state) != source_thread_id
+        or str(oracle.get("slug") or oracle.get("session_locator") or "") != str(payload.get("slug") or "")
+        or str(mission.get("sha256") or "") != str(payload.get("mission_sha256") or "")
+        or str(archived_state.get("session_authority") or "")
+        != str(payload.get("session_authority_preserved") or "")
+        or _snapshot_quarantine_tree(archive) != payload.get("tree_snapshot")
+    ):
+        raise OracleRunError(
+            "QUARANTINE_ARCHIVE_INVALID",
+            "Oracle quarantine archive identity or tree digest changed",
+            {"path": str(archive), "run_id": run_id},
+        )
+    return payload
+
+
+def pending_unknown_run_quarantines(
+    run_root: Path,
+    project_root: Path,
+    *,
+    source_thread_id: str | None,
+) -> list[dict[str, Any]]:
+    """Return quarantined unknown outcomes that still forbid a fresh prompt."""
+    owner = str(source_thread_id or "").strip().casefold()
+    if STATE.SOURCE_THREAD_ID_RE.fullmatch(owner) is None:
+        return []
+    receipt_root = run_root.expanduser().resolve().parent / "quarantine-lock-receipts" / owner
+    if not receipt_root.is_dir() or receipt_root.is_symlink():
+        return []
+    pending: list[dict[str, Any]] = []
+    for completion_path in sorted(receipt_root.glob("*.complete.json"), key=lambda item: item.name):
+        run_id = completion_path.name.removesuffix(".complete.json")
+        try:
+            completion = _validate_quarantine_completion(
+                completion_path,
+                run_root=run_root,
+                project_root=project_root,
+                source_thread_id=owner,
+            )
+            paths = _quarantine_paths(run_root, source_thread_id=owner, run_id=run_id)
+            authorization_path = paths["authorization"]
+            if authorization_path.exists() or authorization_path.is_symlink():
+                authorization = _read_regular_json(authorization_path)
+                expected_authorization = {
+                    "schema": "codex.chatgpt.oracle-unknown-run-retry-authorization/v1",
+                    "confirmation": UNKNOWN_RUN_RETRY_CONFIRMATION,
+                    "target_source_thread_id": owner,
+                    "project_root": str(project_root.expanduser().resolve()),
+                    "run_id": run_id,
+                    "completion_receipt": str(completion_path),
+                    "completion_sha256": STATE.sha256_file(completion_path),
+                    "provider_outcome": "unknown",
+                    "duplicate_execution_risk_acknowledged": True,
+                    "new_submission_authorized": True,
+                }
+                if any(
+                    authorization.get(key) != value
+                    for key, value in expected_authorization.items()
+                ):
+                    raise OracleRunError(
+                        "QUARANTINE_RETRY_AUTHORIZATION_INVALID",
+                        "Oracle quarantine retry authorization is inconsistent",
+                        {"path": str(authorization_path), "run_id": run_id},
+                    )
+                continue
+            pending.append({
+                "run_id": run_id,
+                "slug": str(completion.get("slug") or ""),
+                "provider_outcome": "unknown",
+                "completion_receipt": str(completion_path),
+                "completion_sha256": STATE.sha256_file(completion_path),
+                "next_action": "authorize-retry-after-quarantine",
+            })
+        except OracleRunError as exc:
+            pending.append({
+                "run_id": run_id,
+                "provider_outcome": "unknown",
+                "completion_receipt": str(completion_path),
+                "error": exc.envelope()["error"],
+                "next_action": "repair-quarantine-receipt-before-new-submission",
+            })
+    return pending
+
+
+def _inspect_unknown_run_quarantine_candidate(
+    run_dir: Path,
+    *,
+    expected_state_sha256: str,
+    caller: str,
+) -> dict[str, Any]:
+    if not run_dir.is_absolute() or run_dir.resolve(strict=True) != run_dir:
+        raise OracleRunError(
+            "QUARANTINE_RUN_DIR_INVALID",
+            "Oracle quarantine requires the exact canonical run directory",
+            {"run_dir": str(run_dir)},
+        )
+    if run_dir.parent.name != "runs" or not STATE.is_within(STATE.oracle_state_root(), run_dir):
+        raise OracleRunError(
+            "QUARANTINE_RUN_DIR_INVALID",
+            "Oracle quarantine is limited to the active Oracle state tree",
+            {"run_dir": str(run_dir)},
+        )
+    state_path = run_dir / "state.json"
+    if state_path.is_symlink() or not state_path.is_file():
+        raise OracleRunError("QUARANTINE_STATE_INVALID", "exact run state must be a regular file")
+    if STATE.sha256_file(state_path) != expected_state_sha256:
+        raise OracleRunError("QUARANTINE_STATE_CHANGED", "exact run state hash changed")
+    state = STATE.load_state(state_path)
+    owner = STATE.source_thread_id_from_state(state)
+    if owner is None or owner != caller:
+        raise OracleRunError(
+            "FOREIGN_TASK_SESSION",
+            "only the exact owning task may quarantine a bound Oracle run",
+            {"target_source_thread_id": owner, "evaluated_from_thread": caller},
+        )
+    run_id = str(state.get("run_id") or "")
+    authority = str(state.get("session_authority") or "").strip().casefold()
+    if run_id != run_dir.name or authority not in {"submitted_unknown", "live", "terminal_observed"}:
+        raise OracleRunError(
+            "QUARANTINE_LIFECYCLE_INVALID",
+            "only an unresolved active Oracle owner may be quarantined",
+            {"run_id": run_id, "session_authority": authority},
+        )
+    project_root = Path(str(state.get("project_root") or "")).expanduser().resolve(strict=True)
+    owners = STATE.unresolved_project_sessions(
+        run_dir.parent,
+        project_root,
+        source_thread_id=owner,
+    )
+    if run_id not in {str(item.get("run_id") or "") for item in owners}:
+        raise OracleRunError(
+            "QUARANTINE_LOCK_NOT_ACTIVE",
+            "the exact run no longer owns an active project lock",
+            {"run_id": run_id},
+        )
+    oracle = state.get("oracle") if isinstance(state.get("oracle"), dict) else {}
+    slug = str(oracle.get("slug") or oracle.get("session_locator") or "")
+    if not slug:
+        raise OracleRunError("QUARANTINE_SLUG_INVALID", "exact Oracle slug is required")
+    meta_evidence = _oracle_meta_quarantine_evidence(slug)
+    process_ids = sorted({
+        *run_owned_process_ids(run_dir, state),
+        *meta_evidence["process_ids"],
+    })
+    active_process_ids = [
+        pid for pid in process_ids if run_owned_process_is_alive(run_dir, state, pid)
+    ]
+    if active_process_ids:
+        raise OracleRunError(
+            "QUARANTINE_PROCESS_ACTIVE",
+            "stop or recover every exact run-owned process before quarantine",
+            {"active_process_ids": active_process_ids},
+        )
+    return {
+        "project_root": str(project_root),
+        "run_id": run_id,
+        "slug": slug,
+        "target_source_thread_id": owner,
+        "state_sha256": expected_state_sha256,
+        "mission_sha256": str((state.get("mission") or {}).get("sha256") or ""),
+        "session_authority_preserved": authority,
+        "oracle_meta": meta_evidence,
+        "stopped_process_ids": process_ids,
+        "tree_snapshot": _snapshot_quarantine_tree(run_dir),
+    }
+
+
+def quarantine_unknown_run(
+    run_dir: Path,
+    *,
+    expected_state_sha256: str,
+    confirmation: str,
+    reason: str,
+    dry_run: bool = False,
+    platform_name: str | None = None,
+) -> dict[str, Any]:
+    """Archive one owned unknown run without claiming a provider outcome.
+
+    The intent is append-only and written before the atomic sibling rename.
+    Repeating the command resumes either side of that boundary, so a host crash
+    cannot turn the administrative escape hatch into another permanent lock.
+    """
+    requested = run_dir.expanduser()
+    if not requested.is_absolute():
+        raise OracleRunError("QUARANTINE_RUN_DIR_INVALID", "run directory must be absolute")
+    canonical = requested.resolve(strict=False)
+    if canonical != requested:
+        raise OracleRunError("QUARANTINE_RUN_DIR_INVALID", "run directory must be canonical")
+    caller = STATE.current_source_thread_id()
+    if caller is None:
+        raise OracleRunError(
+            "QUARANTINE_EVALUATED_FROM_THREAD_REQUIRED",
+            "the authorizing Codex task must be identified",
+        )
+    if confirmation != UNKNOWN_RUN_QUARANTINE_CONFIRMATION or not reason.strip():
+        raise OracleRunError(
+            "QUARANTINE_AUTHORITY_REQUIRED",
+            "exact user quarantine confirmation and a reason are required",
+        )
+    run_root = canonical.parent
+    paths = _quarantine_paths(run_root, source_thread_id=caller, run_id=canonical.name)
+    if paths["completion"].exists() or paths["completion"].is_symlink():
+        recorded = _read_regular_json(paths["completion"])
+        project_root = Path(str(recorded.get("project_root") or ""))
+        completion = _validate_quarantine_completion(
+            paths["completion"], run_root=run_root,
+            project_root=project_root, source_thread_id=caller,
+        )
+        if completion.get("state_sha256") != expected_state_sha256:
+            raise OracleRunError("QUARANTINE_STATE_CHANGED", "completed quarantine has a different state hash")
+        if (
+            completion.get("confirmation") != confirmation
+            or completion.get("reason") != reason.strip()
+        ):
+            raise OracleRunError(
+                "QUARANTINE_COMPLETION_CONFLICT",
+                "completed quarantine does not match this exact user decision",
+            )
+        return completion
+
+    intent: dict[str, Any] | None = None
+    if paths["intent"].exists() or paths["intent"].is_symlink():
+        intent = _read_regular_json(paths["intent"])
+        expected_intent = {
+            "schema": "codex.chatgpt.oracle-unknown-run-quarantine/v1",
+            "status": "quarantine-intent",
+            "evaluated_from_thread": caller,
+            "target_source_thread_id": caller,
+            "confirmation": confirmation,
+            "reason": reason.strip(),
+            "original_run_dir": str(canonical),
+            "archive_run_dir": str(paths["archive"]),
+            "intent_receipt": str(paths["intent"]),
+            "completion_receipt": str(paths["completion"]),
+            "provider_outcome": "unknown",
+            "new_submission_authorized": False,
+            "state_sha256": expected_state_sha256,
+        }
+        if any(intent.get(key) != value for key, value in expected_intent.items()):
+            raise OracleRunError(
+                "QUARANTINE_INTENT_CONFLICT",
+                "existing quarantine intent does not match this exact operation",
+                {"intent_receipt": str(paths["intent"])},
+            )
+        if canonical.exists() == paths["archive"].exists():
+            raise OracleRunError(
+                "QUARANTINE_MOVE_STATE_AMBIGUOUS",
+                "exactly one active or archived run directory must exist while resuming quarantine",
+                {"run_dir": str(canonical), "archive_run_dir": str(paths["archive"])},
+            )
+        evidence = {
+            key: intent[key]
+            for key in (
+                "project_root", "run_id", "slug", "target_source_thread_id",
+                "state_sha256", "mission_sha256", "session_authority_preserved",
+                "oracle_meta", "stopped_process_ids", "tree_snapshot",
+            )
+        }
+        if canonical.exists():
+            current = _inspect_unknown_run_quarantine_candidate(
+                canonical, expected_state_sha256=expected_state_sha256, caller=caller,
+            )
+            if current != evidence:
+                raise OracleRunError("QUARANTINE_EVIDENCE_CHANGED", "run evidence changed after quarantine intent")
+        elif _snapshot_quarantine_tree(paths["archive"]) != evidence["tree_snapshot"]:
+            raise OracleRunError(
+                "QUARANTINE_ARCHIVE_VERIFICATION_FAILED",
+                "archived run tree no longer matches the quarantine intent",
+                {"archive_run_dir": str(paths["archive"])},
+            )
+    else:
+        if paths["archive"].exists() or paths["archive"].is_symlink():
+            raise OracleRunError(
+                "QUARANTINE_ARCHIVE_WITHOUT_INTENT",
+                "an archive without its append-only intent requires manual evidence repair",
+                {"archive_run_dir": str(paths["archive"])},
+            )
+        evidence = _inspect_unknown_run_quarantine_candidate(
+            canonical, expected_state_sha256=expected_state_sha256, caller=caller,
+        )
+
+    result = {
+        "schema": "codex.chatgpt.oracle-unknown-run-quarantine/v1",
+        "ok": True,
+        "status": "dry-run" if dry_run else "unknown-run-quarantined",
+        "evaluated_from_thread": caller,
+        "target_source_thread_id": caller,
+        "confirmation": confirmation,
+        "reason": reason.strip(),
+        "original_run_dir": str(canonical),
+        "archive_run_dir": str(paths["archive"]),
+        "intent_receipt": str(paths["intent"]),
+        "completion_receipt": str(paths["completion"]),
+        "provider_outcome": "unknown",
+        "new_submission_authorized": False,
+        "lock_released": bool(paths["archive"].exists()),
+        **evidence,
+    }
+    if dry_run:
+        return result
+    project_root = Path(evidence["project_root"])
+    with (
+        STATE.exact_run_recovery_mutex(
+            canonical,
+            timeout_seconds=30,
+            platform_name=platform_name,
+        ),
+        STATE.project_submit_mutex(
+            project_root,
+            timeout_seconds=30,
+            platform_name=platform_name,
+            source_thread_id=caller,
+        ),
+    ):
+        for parent in (paths["archive_root"], paths["receipt_root"]):
+            if parent.exists() and (parent.is_symlink() or not parent.is_dir()):
+                raise OracleRunError("QUARANTINE_PATH_INVALID", "quarantine parent is unsafe", {"path": str(parent)})
+            parent.mkdir(parents=True, exist_ok=True)
+        if paths["authorization"].exists() or paths["authorization"].is_symlink():
+            raise OracleRunError("QUARANTINE_DESTINATION_EXISTS", "retry authorization predates quarantine completion")
+        if intent is None:
+            current = _inspect_unknown_run_quarantine_candidate(
+                canonical, expected_state_sha256=expected_state_sha256, caller=caller,
+            )
+            if current != evidence:
+                raise OracleRunError("QUARANTINE_EVIDENCE_CHANGED", "run evidence changed before quarantine")
+            intent = {
+                **result,
+                "status": "quarantine-intent",
+                "lock_released": False,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            intent_sha256 = STATE._write_append_only_json(paths["intent"], intent)
+        else:
+            intent_sha256 = STATE.sha256_file(paths["intent"])
+        if canonical.exists():
+            if paths["archive"].exists() or paths["archive"].is_symlink():
+                raise OracleRunError("QUARANTINE_DESTINATION_EXISTS", "active and archived run both exist")
+            canonical.rename(paths["archive"])
+        if _snapshot_quarantine_tree(paths["archive"]) != evidence["tree_snapshot"]:
+            raise OracleRunError(
+                "QUARANTINE_ARCHIVE_VERIFICATION_FAILED",
+                "archived run tree changed during quarantine",
+                {"archive_run_dir": str(paths["archive"])},
+            )
+        completion = {
+            **result,
+            "status": "unknown-run-quarantined",
+            "lock_released": True,
+            "intent_sha256": intent_sha256,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        STATE._write_append_only_json(paths["completion"], completion)
+        remaining = STATE.unresolved_project_sessions(
+            run_root,
+            project_root,
+            source_thread_id=caller,
+        )
+        completion["remaining_same_task_locks"] = remaining
+    return completion
+
+
+def authorize_retry_after_unknown_quarantine(
+    completion_receipt: Path,
+    *,
+    expected_completion_sha256: str,
+    confirmation: str,
+    reason: str,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Acknowledge possible duplicate execution before permitting fresh work."""
+    caller = STATE.current_source_thread_id()
+    if caller is None:
+        raise OracleRunError(
+            "QUARANTINE_EVALUATED_FROM_THREAD_REQUIRED",
+            "the authorizing Codex task must be identified",
+        )
+    receipt = completion_receipt.expanduser().resolve(strict=True)
+    if confirmation != UNKNOWN_RUN_RETRY_CONFIRMATION or not reason.strip():
+        raise OracleRunError(
+            "QUARANTINE_RETRY_AUTHORITY_REQUIRED",
+            "exact user retry confirmation and a reason are required",
+        )
+    if STATE.sha256_file(receipt) != expected_completion_sha256:
+        raise OracleRunError("QUARANTINE_COMPLETION_CHANGED", "quarantine completion hash changed")
+    completion = _read_regular_json(receipt)
+    owner = str(completion.get("target_source_thread_id") or "").strip().casefold()
+    if owner != caller:
+        raise OracleRunError(
+            "FOREIGN_TASK_SESSION",
+            "only the exact owning task may authorize work after quarantine",
+            {"target_source_thread_id": owner, "evaluated_from_thread": caller},
+        )
+    project_root = Path(str(completion.get("project_root") or "")).expanduser().resolve(strict=True)
+    run_root = Path(str(completion.get("original_run_dir") or "")).parent
+    validated = _validate_quarantine_completion(
+        receipt,
+        run_root=run_root,
+        project_root=project_root,
+        source_thread_id=caller,
+    )
+    run_id = str(validated.get("run_id") or "")
+    paths = _quarantine_paths(run_root, source_thread_id=caller, run_id=run_id)
+    if paths["authorization"].exists() or paths["authorization"].is_symlink():
+        existing = _read_regular_json(paths["authorization"])
+        expected_existing = {
+            "schema": "codex.chatgpt.oracle-unknown-run-retry-authorization/v1",
+            "status": "retry-authorized-after-unknown-quarantine",
+            "target_source_thread_id": caller,
+            "project_root": str(project_root),
+            "run_id": run_id,
+            "confirmation": confirmation,
+            "reason": reason.strip(),
+            "completion_receipt": str(receipt),
+            "completion_sha256": expected_completion_sha256,
+            "provider_outcome": "unknown",
+            "duplicate_execution_risk_acknowledged": True,
+            "new_submission_authorized": True,
+        }
+        if any(existing.get(key) != value for key, value in expected_existing.items()):
+            raise OracleRunError(
+                "QUARANTINE_RETRY_AUTHORIZATION_CONFLICT",
+                "existing retry authorization does not match this exact decision",
+                {"path": str(paths["authorization"])},
+            )
+        return existing
+    authorization = {
+        "schema": "codex.chatgpt.oracle-unknown-run-retry-authorization/v1",
+        "ok": True,
+        "status": "dry-run" if dry_run else "retry-authorized-after-unknown-quarantine",
+        "evaluated_from_thread": caller,
+        "target_source_thread_id": caller,
+        "project_root": str(project_root),
+        "run_id": run_id,
+        "slug": str(validated.get("slug") or ""),
+        "confirmation": confirmation,
+        "reason": reason.strip(),
+        "completion_receipt": str(receipt),
+        "completion_sha256": expected_completion_sha256,
+        "provider_outcome": "unknown",
+        "duplicate_execution_risk_acknowledged": True,
+        "new_submission_authorized": True,
+    }
+    if dry_run:
+        return authorization
+    with STATE.project_submit_mutex(
+        project_root,
+        timeout_seconds=30,
+        source_thread_id=caller,
+    ):
+        if STATE.sha256_file(receipt) != expected_completion_sha256:
+            raise OracleRunError("QUARANTINE_COMPLETION_CHANGED", "quarantine completion hash changed")
+        if paths["authorization"].exists() or paths["authorization"].is_symlink():
+            existing = _read_regular_json(paths["authorization"])
+            if any(
+                existing.get(key) != value
+                for key, value in authorization.items()
+                if key != "status"
+            ) or existing.get("status") != "retry-authorized-after-unknown-quarantine":
+                raise OracleRunError(
+                    "QUARANTINE_RETRY_AUTHORIZATION_CONFLICT",
+                    "existing retry authorization does not match this exact decision",
+                    {"path": str(paths["authorization"])},
+                )
+            return existing
+        authorization["authorized_at"] = datetime.now(timezone.utc).isoformat()
+        authorization["status"] = "retry-authorized-after-unknown-quarantine"
+        STATE._write_append_only_json(paths["authorization"], authorization)
+    return authorization
 
 
 def historical_session_authority(run_dir: Path, state: dict[str, Any]) -> str:
@@ -1881,6 +2569,17 @@ def execute_run(
                         "PROJECT_SESSION_STILL_LIVE",
                         "an exact Oracle session still owns this project; recover it before submitting",
                         {"owners": owners},
+                    )
+                quarantines = pending_unknown_run_quarantines(
+                    config.run_root,
+                    config.project_root,
+                    source_thread_id=config.source_thread_id,
+                )
+                if quarantines:
+                    raise OracleRunError(
+                        "PROJECT_UNKNOWN_RUN_QUARANTINED",
+                        "an unknown Oracle outcome was quarantined; explicit retry authorization is required before a fresh prompt",
+                        {"quarantines": quarantines},
                     )
                 original_mission_sha256 = STATE.sha256_file(config.mission_path)
                 current_mission_sha256 = STATE.sha256_file(transport_mission_path)
@@ -4324,6 +5023,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     read_route_refresh_parser.add_argument("--reason", required=True)
     read_route_refresh_parser.add_argument("--dry-run", action="store_true")
+    quarantine_parser = commands.add_parser("quarantine-unknown-run")
+    quarantine_parser.add_argument("--run-dir", type=Path, required=True)
+    quarantine_parser.add_argument("--expected-state-sha256", required=True)
+    quarantine_parser.add_argument(
+        "--confirmation",
+        choices=(UNKNOWN_RUN_QUARANTINE_CONFIRMATION,),
+        required=True,
+    )
+    quarantine_parser.add_argument("--reason", required=True)
+    quarantine_parser.add_argument("--dry-run", action="store_true")
+    retry_parser = commands.add_parser("authorize-retry-after-quarantine")
+    retry_parser.add_argument("--completion-receipt", type=Path, required=True)
+    retry_parser.add_argument("--expected-completion-sha256", required=True)
+    retry_parser.add_argument(
+        "--confirmation",
+        choices=(UNKNOWN_RUN_RETRY_CONFIRMATION,),
+        required=True,
+    )
+    retry_parser.add_argument("--reason", required=True)
+    retry_parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -4423,7 +5142,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_mission_sha256=args.expected_mission_sha256,
                 dry_run=args.dry_run,
             )
-        else:
+        elif args.command == "settle-terminal-devspace-read-route-refresh":
             payload = settle_terminal_devspace_read_route_refresh_fresh_run(
                 args.run_dir,
                 confirmation=args.confirmation,
@@ -4434,6 +5153,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 expected_stdout_sha256=args.expected_stdout_sha256,
                 expected_stderr_sha256=args.expected_stderr_sha256,
                 expected_mission_sha256=args.expected_mission_sha256,
+                dry_run=args.dry_run,
+            )
+        elif args.command == "quarantine-unknown-run":
+            payload = quarantine_unknown_run(
+                args.run_dir,
+                expected_state_sha256=args.expected_state_sha256,
+                confirmation=args.confirmation,
+                reason=args.reason,
+                dry_run=args.dry_run,
+            )
+        else:
+            payload = authorize_retry_after_unknown_quarantine(
+                args.completion_receipt,
+                expected_completion_sha256=args.expected_completion_sha256,
+                confirmation=args.confirmation,
+                reason=args.reason,
                 dry_run=args.dry_run,
             )
     except STATE.OracleStateError as exc:

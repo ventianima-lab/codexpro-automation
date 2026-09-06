@@ -1,5 +1,15 @@
 # 기술 변경 기록
 
+## Unreleased - Add an unknown-run lock quarantine escape hatch
+
+- Same-task operators can now quarantine any stopped unresolved Oracle run
+  after ordinary recovery is exhausted. The provider outcome remains unknown,
+  the unchanged run is atomically archived with crash-resumable append-only
+  receipts, and the active local lock is released.
+- Fresh prompts remain blocked by the quarantine receipt until a separate,
+  exact-hash user authorization acknowledges possible duplicate execution.
+  Foreign-task ownership and live run-owned processes remain fail-closed.
+
 ## 1.20.15 - Verify the current GPT-5.6 Sol Pro power slider
 
 - Oracle 0.18.0 now recognizes ChatGPT's current unified `Thinking effort`

@@ -6173,3 +6173,243 @@ def test_recursive_self_observation_settlement_rejects_generic_blocked_output(tm
             expected_transcript_sha256=runner.STATE.sha256_file(transcript),
         )
     assert exc.value.code == "RECURSIVE_SELF_OBSERVATION_EVIDENCE_REQUIRED"
+
+
+@pytest.fixture
+def unknown_run_quarantine_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runner = load_runner()
+    owner = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    monkeypatch.setenv("CODEX_THREAD_ID", owner)
+    monkeypatch.setenv("CODEX_ORACLE_STATE_ROOT", str(tmp_path / "ledger"))
+    project = (tmp_path / "project").resolve()
+    project.mkdir()
+    mission = project / "mission.md"
+    mission.write_text("Inspect and update the project.", encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({
+        "schema": runner.STATE.SCHEMA,
+        "project_root": str(project),
+        "mission_path": str(mission),
+        "app_name": "codex",
+        "mode": "browser",
+        "run_root": str(tmp_path / "ledger" / "projects" / "project-1" / "runs"),
+    }), encoding="utf-8")
+    config = runner.STATE.load_manifest(manifest_path, bind_runtime_task=True)
+    layout = runner.STATE.create_layout(config, run_id="unknown-run-12345678")
+    layout.run_dir.mkdir(parents=True)
+    state = runner.STATE.state_payload(
+        config,
+        layout,
+        status="attention_required",
+        resolved_version="0.18.0",
+        cdp_port=43101,
+    )
+    state.update(
+        session_authority="submitted_unknown",
+        transport_status="failed",
+        browser_observer={"oracle_process_pid": 2_000_000_001},
+    )
+    state["mission"]["transport_path"] = str(layout.run_dir / "mission.md")
+    runner.STATE.write_json_atomic(layout.state_path, state)
+    (layout.run_dir / "mission.md").write_bytes(mission.read_bytes())
+    layout.stdout_path.write_text("prompt commit timeout\n", encoding="utf-8")
+    layout.stderr_path.write_text("", encoding="utf-8")
+    runner.STATE.persist_ownership_receipt(
+        layout.state_path,
+        oracle_process_pid=2_000_000_001,
+    )
+    monkeypatch.setattr(runner, "run_owned_process_is_alive", lambda *args, **kwargs: False)
+    return runner, owner, project, layout
+
+
+def test_unknown_run_quarantine_releases_lock_but_requires_separate_retry_authority(
+    unknown_run_quarantine_candidate,
+) -> None:
+    runner, owner, project, layout = unknown_run_quarantine_candidate
+    state_before = layout.state_path.read_bytes()
+    state_sha256 = runner.STATE.sha256_file(layout.state_path)
+    assert [item["run_id"] for item in runner.STATE.unresolved_project_sessions(
+        layout.run_dir.parent,
+        project,
+        source_thread_id=owner,
+    )] == [layout.run_id]
+
+    preview = runner.quarantine_unknown_run(
+        layout.run_dir,
+        expected_state_sha256=state_sha256,
+        confirmation=runner.UNKNOWN_RUN_QUARANTINE_CONFIRMATION,
+        reason="The user authorized quarantine of this exact unknown run.",
+        dry_run=True,
+    )
+    assert preview["status"] == "dry-run"
+    assert preview["provider_outcome"] == "unknown"
+    assert preview["new_submission_authorized"] is False
+    assert layout.run_dir.exists()
+
+    result = runner.quarantine_unknown_run(
+        layout.run_dir,
+        expected_state_sha256=state_sha256,
+        confirmation=runner.UNKNOWN_RUN_QUARANTINE_CONFIRMATION,
+        reason="The user authorized quarantine of this exact unknown run.",
+    )
+    archive = Path(result["archive_run_dir"])
+    completion = Path(result["completion_receipt"])
+    assert result["status"] == "unknown-run-quarantined"
+    assert result["lock_released"] is True
+    assert not layout.run_dir.exists()
+    assert (archive / "state.json").read_bytes() == state_before
+    assert runner.STATE.unresolved_project_sessions(
+        layout.run_dir.parent,
+        project,
+        source_thread_id=owner,
+    ) == []
+    pending = runner.pending_unknown_run_quarantines(
+        layout.run_dir.parent,
+        project,
+        source_thread_id=owner,
+    )
+    assert [item["run_id"] for item in pending] == [layout.run_id]
+    assert pending[0]["next_action"] == "authorize-retry-after-quarantine"
+
+    completion_sha256 = runner.STATE.sha256_file(completion)
+    retry_preview = runner.authorize_retry_after_unknown_quarantine(
+        completion,
+        expected_completion_sha256=completion_sha256,
+        confirmation=runner.UNKNOWN_RUN_RETRY_CONFIRMATION,
+        reason="The user accepts the possible duplicate outcome before retrying.",
+        dry_run=True,
+    )
+    assert retry_preview["status"] == "dry-run"
+    assert runner.pending_unknown_run_quarantines(
+        layout.run_dir.parent,
+        project,
+        source_thread_id=owner,
+    )
+    retry = runner.authorize_retry_after_unknown_quarantine(
+        completion,
+        expected_completion_sha256=completion_sha256,
+        confirmation=runner.UNKNOWN_RUN_RETRY_CONFIRMATION,
+        reason="The user accepts the possible duplicate outcome before retrying.",
+    )
+    assert retry["status"] == "retry-authorized-after-unknown-quarantine"
+    assert retry["duplicate_execution_risk_acknowledged"] is True
+    assert runner.pending_unknown_run_quarantines(
+        layout.run_dir.parent,
+        project,
+        source_thread_id=owner,
+    ) == []
+    repeated_retry = runner.authorize_retry_after_unknown_quarantine(
+        completion,
+        expected_completion_sha256=completion_sha256,
+        confirmation=runner.UNKNOWN_RUN_RETRY_CONFIRMATION,
+        reason="The user accepts the possible duplicate outcome before retrying.",
+    )
+    assert repeated_retry == retry
+
+
+def test_unknown_run_quarantine_fails_closed_for_foreign_owner_or_live_process(
+    unknown_run_quarantine_candidate,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _, _, layout = unknown_run_quarantine_candidate
+    state_sha256 = runner.STATE.sha256_file(layout.state_path)
+    monkeypatch.setenv("CODEX_THREAD_ID", "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    with pytest.raises(runner.OracleRunError, match="exact owning task"):
+        runner.quarantine_unknown_run(
+            layout.run_dir,
+            expected_state_sha256=state_sha256,
+            confirmation=runner.UNKNOWN_RUN_QUARANTINE_CONFIRMATION,
+            reason="Foreign tasks must not quarantine this run.",
+        )
+    monkeypatch.setenv("CODEX_THREAD_ID", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    monkeypatch.setattr(runner, "run_owned_process_is_alive", lambda *args, **kwargs: True)
+    with pytest.raises(runner.OracleRunError, match="exact run-owned process"):
+        runner.quarantine_unknown_run(
+            layout.run_dir,
+            expected_state_sha256=state_sha256,
+            confirmation=runner.UNKNOWN_RUN_QUARANTINE_CONFIRMATION,
+            reason="Live exact processes must remain protected.",
+        )
+
+
+def test_unknown_run_quarantine_resumes_after_atomic_move_crash(
+    unknown_run_quarantine_candidate,
+) -> None:
+    runner, owner, _, layout = unknown_run_quarantine_candidate
+    state_sha256 = runner.STATE.sha256_file(layout.state_path)
+    reason = "Resume the exact quarantine after a host crash."
+    preview = runner.quarantine_unknown_run(
+        layout.run_dir,
+        expected_state_sha256=state_sha256,
+        confirmation=runner.UNKNOWN_RUN_QUARANTINE_CONFIRMATION,
+        reason=reason,
+        dry_run=True,
+    )
+    paths = runner._quarantine_paths(
+        layout.run_dir.parent,
+        source_thread_id=owner,
+        run_id=layout.run_id,
+    )
+    paths["archive_root"].mkdir(parents=True)
+    paths["receipt_root"].mkdir(parents=True)
+    intent = {
+        **preview,
+        "status": "quarantine-intent",
+        "lock_released": False,
+        "created_at": "2026-09-06T00:00:00+00:00",
+    }
+    runner.STATE._write_append_only_json(paths["intent"], intent)
+    layout.run_dir.rename(paths["archive"])
+
+    result = runner.quarantine_unknown_run(
+        layout.run_dir,
+        expected_state_sha256=state_sha256,
+        confirmation=runner.UNKNOWN_RUN_QUARANTINE_CONFIRMATION,
+        reason=reason,
+    )
+    assert result["status"] == "unknown-run-quarantined"
+    assert paths["completion"].is_file()
+    repeated = runner.quarantine_unknown_run(
+        layout.run_dir,
+        expected_state_sha256=state_sha256,
+        confirmation=runner.UNKNOWN_RUN_QUARANTINE_CONFIRMATION,
+        reason=reason,
+    )
+    assert repeated == json.loads(paths["completion"].read_text(encoding="utf-8"))
+
+
+def test_fresh_run_is_blocked_until_unknown_quarantine_retry_is_authorized(
+    unknown_run_quarantine_candidate,
+) -> None:
+    runner, _, project, layout = unknown_run_quarantine_candidate
+    state_sha256 = runner.STATE.sha256_file(layout.state_path)
+    runner.quarantine_unknown_run(
+        layout.run_dir,
+        expected_state_sha256=state_sha256,
+        confirmation=runner.UNKNOWN_RUN_QUARANTINE_CONFIRMATION,
+        reason="Quarantine before testing the fresh-run gate.",
+    )
+    next_mission = project / "next-mission.md"
+    next_mission.write_text("Continue only after explicit retry authority.", encoding="utf-8")
+    next_manifest = project.parent / "next-manifest.json"
+    next_manifest.write_text(json.dumps({
+        "schema": runner.STATE.SCHEMA,
+        "project_root": str(project),
+        "mission_path": str(next_mission),
+        "app_name": "codex",
+        "mode": "browser",
+        "run_root": str(layout.run_dir.parent),
+    }), encoding="utf-8")
+    spawned = []
+    result = runner.execute_run(
+        next_manifest,
+        version_resolver=lambda *args, **kwargs: "oracle 0.18.0",
+        compat_factory=lambda version: {},
+        devspace_compat_factory=lambda: {"service_restart_required": False},
+        devspace_qualification_factory=lambda root: {"ok": True},
+        popen_factory=lambda *args, **kwargs: spawned.append((args, kwargs)),
+    )
+    assert result["ok"] is False
+    assert spawned == []
+    stderr = Path(result["run_dir"]) / "stderr.log"
+    assert "PROJECT_UNKNOWN_RUN_QUARANTINED" in stderr.read_text(encoding="utf-8")
